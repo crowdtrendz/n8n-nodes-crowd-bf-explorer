@@ -52,9 +52,14 @@ export class CrowdBfExplorer implements INodeType {
 						description: 'Get recent Minswap/DEX orders for a wallet',
 					},
 					{
-						name: 'Parse Trading History',
+						name: 'Get DEX History',
 						value: 'parseTradingHistory',
 						description: 'Parse recent orders into clean trading history with prices',
+					},
+					{
+						name: 'Get Latest DEX Trade',
+						value: 'getLatestDexTrade',
+						description: 'Get the most recent DEX trade from last 10 transactions',
 					},
 				],
 				default: 'getAddressInfo',
@@ -63,6 +68,11 @@ export class CrowdBfExplorer implements INodeType {
 				displayName: 'Network',
 				name: 'network',
 				type: 'options',
+				displayOptions: {
+					show: {
+						operation: ['getAddressInfo', 'getTransaction', 'getRecentOrders', 'parseTradingHistory'],
+					},
+				},
 				options: [
 					{
 						name: 'Mainnet',
@@ -126,6 +136,40 @@ export class CrowdBfExplorer implements INodeType {
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const items = this.getInputData();
 		const returnData: INodeExecutionData[] = [];
+
+		// Special handling for getLatestDexTrade - process all items at once
+		if (items.length > 0) {
+			const operation = this.getNodeParameter('operation', 0) as string;
+
+			if (operation === 'getLatestDexTrade') {
+				// Process all input items to find the latest trade
+				const allTrades = items.map(item => item.json).filter(trade => trade && trade.timestamp);
+
+				if (allTrades.length > 0) {
+					const latestTrade = allTrades.reduce((latest, current) =>
+						new Date(current.timestamp as string) > new Date(latest.timestamp as string) ? current : latest
+					);
+
+					returnData.push({
+						json: {
+							...latestTrade,
+							operation: 'getLatestDexTrade',
+						},
+					});
+				} else {
+					returnData.push({
+						json: {
+							operation: 'getLatestDexTrade',
+							success: false,
+							error: 'No valid trade data found in input. This operation should be used after Get DEX History.',
+							note: 'Connect this node after Get DEX History to process trade data.',
+						},
+					});
+				}
+
+				return [returnData];
+			}
+		}
 
 		// Get credentials
 		const credentials = await this.getCredentials('blockfrostApi');
@@ -239,7 +283,7 @@ export class CrowdBfExplorer implements INodeType {
 						for (const trade of tradingHistory.trades) {
 							returnData.push({
 								json: {
-									operation: 'parseTradingHistory',
+									operation: 'getDEXHistory',
 									network,
 									...trade,
 									success: true,
@@ -250,7 +294,7 @@ export class CrowdBfExplorer implements INodeType {
 						// No trades found - return summary
 						returnData.push({
 							json: {
-								operation: 'parseTradingHistory',
+								operation: 'getDEXHistory',
 								network,
 								address,
 								tradesFound: 0,
@@ -261,6 +305,10 @@ export class CrowdBfExplorer implements INodeType {
 							},
 						});
 					}
+
+				} else if (operation === 'getLatestDexTrade') {
+					// This should not be reached since getLatestDexTrade is handled above
+					throw new NodeOperationError(this.getNode(), 'getLatestDexTrade operation should be handled at the beginning of execute()');
 
 				} else if (operation === 'getTransaction') {
 					const transactionHash = this.getNodeParameter('transactionHash', i) as string;
