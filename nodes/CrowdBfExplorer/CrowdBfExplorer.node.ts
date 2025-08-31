@@ -17,7 +17,7 @@ export class CrowdBfExplorer implements INodeType {
 		group: ['transform'],
 		version: 1,
 		subtitle: '={{$parameter["operation"]}}',
-		description: 'Explore Cardano blockchain data and submit transactions via Blockfrost API',
+		description: 'Explore Cardano blockchain data via Blockfrost API',
 		defaults: {
 			name: 'Crowd BF Explorer',
 		},
@@ -55,11 +55,6 @@ export class CrowdBfExplorer implements INodeType {
 						name: 'Parse Trading History',
 						value: 'parseTradingHistory',
 						description: 'Parse recent orders into clean trading history with prices',
-					},
-					{
-						name: 'Submit Transaction',
-						value: 'submitTransaction',
-						description: 'Submit a signed CBOR transaction to the blockchain',
 					},
 				],
 				default: 'getAddressInfo',
@@ -124,63 +119,6 @@ export class CrowdBfExplorer implements INodeType {
 				required: true,
 				description: 'Transaction hash to query',
 				placeholder: 'abc123def456...',
-			},
-			{
-				displayName: 'Transaction CBOR',
-				name: 'transactionCbor',
-				type: 'string',
-				displayOptions: {
-					show: {
-						operation: ['submitTransaction'],
-					},
-				},
-				default: '',
-				required: true,
-				description: 'Signed transaction in CBOR hex format',
-				placeholder: '84a400818258...',
-				typeOptions: {
-					rows: 4,
-				},
-			},
-			{
-				displayName: 'Additional Options',
-				name: 'additionalOptions',
-				type: 'collection',
-				displayOptions: {
-					show: {
-						operation: ['submitTransaction'],
-					},
-				},
-				default: {},
-				placeholder: 'Add Option',
-				options: [
-					{
-						displayName: 'Validate Only',
-						name: 'validateOnly',
-						type: 'boolean',
-						default: false,
-						description: 'Whether to only validate the transaction without submitting it',
-					},
-					{
-						displayName: 'Wait for Confirmation',
-						name: 'waitForConfirmation',
-						type: 'boolean',
-						default: false,
-						description: 'Whether to wait for transaction confirmation before returning',
-					},
-					{
-						displayName: 'Confirmation Timeout (seconds)',
-						name: 'confirmationTimeout',
-						type: 'number',
-						default: 300,
-						description: 'Maximum time to wait for confirmation in seconds',
-						displayOptions: {
-							show: {
-								waitForConfirmation: [true],
-							},
-						},
-					},
-				],
 			},
 		],
 	};
@@ -380,123 +318,6 @@ export class CrowdBfExplorer implements INodeType {
 							success: true,
 						},
 					});
-
-				} else if (operation === 'submitTransaction') {
-					const transactionCbor = this.getNodeParameter('transactionCbor', i) as string;
-					const additionalOptions = this.getNodeParameter('additionalOptions', i, {}) as {
-						validateOnly?: boolean;
-						waitForConfirmation?: boolean;
-						confirmationTimeout?: number;
-					};
-
-					// Validate CBOR format
-					if (!CrowdBfExplorer.isValidCborHex(transactionCbor)) {
-						throw new NodeOperationError(
-							this.getNode(),
-							'Invalid CBOR hex format. Transaction CBOR must be a valid hexadecimal string.'
-						);
-					}
-
-					// Clean the CBOR string (remove whitespace and ensure proper format)
-					const cleanCbor = transactionCbor.replace(/\s+/g, '').toLowerCase();
-
-					if (additionalOptions.validateOnly) {
-						// Only validate the transaction
-						try {
-							// Blockfrost doesn't have a dedicated validate endpoint,
-							// so we'll do basic CBOR validation here
-							const isValid = CrowdBfExplorer.validateCborStructure(cleanCbor);
-
-							returnData.push({
-								json: {
-									operation: 'submitTransaction',
-									network,
-									transactionCbor: cleanCbor,
-									validation: {
-										isValid,
-										cborLength: cleanCbor.length,
-										estimatedSize: cleanCbor.length / 2, // bytes
-									},
-									success: true,
-									note: 'Validation only - transaction not submitted',
-								},
-							});
-						} catch (error: any) {
-							throw new NodeOperationError(
-								this.getNode(),
-								`CBOR validation failed: ${error.message}`
-							);
-						}
-					} else {
-						// Submit the transaction using Blockfrost SDK
-						try {
-							// Convert hex string to buffer for submission
-							const cborBuffer = Buffer.from(cleanCbor, 'hex');
-
-							// Use Blockfrost SDK for submission - this handles HTTP details internally
-							const txHash = await blockfrost.txSubmit(cborBuffer);
-
-							let confirmationData = null;
-
-							if (additionalOptions.waitForConfirmation) {
-								// Wait for transaction confirmation
-								const timeout = additionalOptions.confirmationTimeout || 300;
-								confirmationData = await CrowdBfExplorer.waitForConfirmation(blockfrost, txHash, timeout);
-							}
-
-							returnData.push({
-								json: {
-									operation: 'submitTransaction',
-									network,
-									transactionCbor: cleanCbor,
-									submission: {
-										transactionHash: txHash,
-										submittedAt: new Date().toISOString(),
-										cborSize: cleanCbor.length / 2, // bytes
-									},
-									confirmation: confirmationData,
-									success: true,
-								},
-							});
-
-						} catch (error: any) {
-							// Handle specific Blockfrost submission errors
-							if (error?.status_code === 400) {
-								const errorMessage = error?.response?.message || error?.message || 'Transaction submission failed';
-								throw new NodeOperationError(
-									this.getNode(),
-									`Transaction rejected by network: ${errorMessage}. Please check your transaction CBOR and ensure it's properly signed.`
-								);
-							} else if (error?.status_code === 405) {
-								throw new NodeOperationError(
-									this.getNode(),
-									'Method not allowed. This may indicate an issue with the Blockfrost API endpoint or the transaction format.'
-								);
-							} else if (error?.status_code === 413) {
-								throw new NodeOperationError(
-									this.getNode(),
-									'Transaction too large. The CBOR transaction exceeds the maximum allowed size.'
-								);
-							} else if (error?.status_code === 403) {
-								throw new NodeOperationError(
-									this.getNode(),
-									'Access forbidden. Please check your Blockfrost API key and permissions.'
-								);
-							} else if (error?.status_code === 429) {
-								throw new NodeOperationError(
-									this.getNode(),
-									'Rate limit exceeded. Please wait and try again later.'
-								);
-							} else {
-								// Generic error handling
-								const errorMessage = error?.response?.message || error?.message || 'Transaction submission failed';
-								throw new NodeOperationError(
-									this.getNode(),
-									`Transaction submission failed: ${errorMessage}`
-								);
-							}
-						}
-					}
 				}
 
 			} catch (error: any) {
@@ -982,101 +803,5 @@ export class CrowdBfExplorer implements INodeType {
 		}
 
 		return 'unknown_dex_operation';
-	}
-
-	/**
-	 * Validate if string is valid hexadecimal CBOR format
-	 */
-	private static isValidCborHex(cbor: string): boolean {
-		const cleanCbor = cbor.replace(/\s+/g, '');
-
-		// Check if it's valid hex
-		if (!/^[0-9a-fA-F]+$/.test(cleanCbor)) {
-			return false;
-		}
-
-		// Check if length is even (hex pairs)
-		if (cleanCbor.length % 2 !== 0) {
-			return false;
-		}
-
-		// Minimum reasonable length for a Cardano transaction
-		if (cleanCbor.length < 100) {
-			return false;
-		}
-
-		return true;
-	}
-
-	/**
-	 * Basic CBOR structure validation for Cardano transactions
-	 */
-	private static validateCborStructure(cbor: string): boolean {
-		try {
-			// Basic checks for Cardano transaction CBOR structure
-			// Cardano transactions typically start with specific CBOR prefixes
-
-			// Check for CBOR array indicator (transactions are CBOR arrays)
-			const firstByte = parseInt(cbor.substring(0, 2), 16);
-
-			// CBOR major type 4 (array) with various lengths
-			const isArray = (firstByte & 0xE0) === 0x80;
-
-			if (!isArray) {
-				throw new Error('CBOR does not appear to be an array structure');
-			}
-
-			return true;
-		} catch (error) {
-			return false;
-		}
-	}
-
-	/**
-	 * Wait for transaction confirmation on the blockchain
-	 */
-	private static async waitForConfirmation(
-		blockfrost: BlockFrostAPI,
-		txHash: string,
-		timeoutSeconds: number
-	): Promise<any> {
-		const startTime = Date.now();
-		const timeout = timeoutSeconds * 1000;
-		const pollInterval = 10000; // 10 seconds
-
-		while (Date.now() - startTime < timeout) {
-			try {
-				const transaction = await blockfrost.txs(txHash);
-
-				if (transaction && transaction.block) {
-					// Transaction is confirmed
-					return {
-						confirmed: true,
-						confirmationTime: new Date().toISOString(),
-						blockHash: transaction.block,
-						blockHeight: transaction.block_height,
-						slot: transaction.slot,
-						waitedSeconds: Math.round((Date.now() - startTime) / 1000),
-					};
-				}
-			} catch (error: any) {
-				// Transaction not yet available, continue waiting
-				if (error?.status_code !== 404) {
-					// Unexpected error
-					throw error;
-				}
-			}
-
-			// Wait before next poll
-			await new Promise<void>((resolve) => setTimeout(resolve, pollInterval));
-		}
-
-		// Timeout reached
-		return {
-			confirmed: false,
-			timedOut: true,
-			waitedSeconds: timeoutSeconds,
-			note: 'Transaction submission successful but confirmation timeout reached. Transaction may still be processing.',
-		};
 	}
 }
