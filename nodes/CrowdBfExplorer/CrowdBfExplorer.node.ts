@@ -52,6 +52,11 @@ export class CrowdBfExplorer implements INodeType {
 						description: 'Get recent Minswap/DEX orders for a wallet',
 					},
 					{
+						name: 'Parse Trading History',
+						value: 'parseTradingHistory',
+						description: 'Parse recent orders into clean trading history with prices',
+					},
+					{
 						name: 'Submit Transaction',
 						value: 'submitTransaction',
 						description: 'Submit a signed CBOR transaction to the blockchain',
@@ -82,7 +87,7 @@ export class CrowdBfExplorer implements INodeType {
 				type: 'string',
 				displayOptions: {
 					show: {
-						operation: ['getAddressInfo', 'getRecentOrders'],
+						operation: ['getAddressInfo', 'getRecentOrders', 'parseTradingHistory'],
 					},
 				},
 				default: '',
@@ -96,7 +101,7 @@ export class CrowdBfExplorer implements INodeType {
 				type: 'number',
 				displayOptions: {
 					show: {
-						operation: ['getRecentOrders'],
+						operation: ['getRecentOrders', 'parseTradingHistory'],
 					},
 				},
 				default: 20,
@@ -280,6 +285,44 @@ export class CrowdBfExplorer implements INodeType {
 							success: true,
 						},
 					});
+
+				} else if (operation === 'parseTradingHistory') {
+					const address = this.getNodeParameter('address', i) as string;
+					const limit = this.getNodeParameter('limit', i) as number;
+
+					// First get the raw orders
+					const orderHistory = await CrowdBfExplorer.getRecentOrdersByMetadata(blockfrost, address, limit);
+
+					// Then parse them into clean trading history
+					const tradingHistory = CrowdBfExplorer.parseTradingHistory(orderHistory, address);
+
+					// Return each trade as a separate item for easier processing
+					if (tradingHistory.trades && tradingHistory.trades.length > 0) {
+						for (const trade of tradingHistory.trades) {
+							returnData.push({
+								json: {
+									operation: 'parseTradingHistory',
+									network,
+									...trade,
+									success: true,
+								},
+							});
+						}
+					} else {
+						// No trades found - return summary
+						returnData.push({
+							json: {
+								operation: 'parseTradingHistory',
+								network,
+								address,
+								tradesFound: 0,
+								transactionsScanned: orderHistory.transactionsScanned,
+								ordersDetected: orderHistory.totalOrders,
+								success: true,
+								note: 'No completed trades found in the scanned transactions',
+							},
+						});
+					}
 
 				} else if (operation === 'getTransaction') {
 					const transactionHash = this.getNodeParameter('transactionHash', i) as string;
@@ -476,6 +519,243 @@ export class CrowdBfExplorer implements INodeType {
 		}
 
 		return [returnData];
+	}
+
+	/**
+	 * Parse trading history from raw order data
+	 */
+	private static parseTradingHistory(orderHistory: any, walletAddress: string) {
+		const orders = [...(orderHistory?.orders || [])].sort((a: any, b: any) =>
+			new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+		);
+
+		const pending: any[] = [];
+		const trades: any[] = [];
+
+		for (const order of orders) {
+			const { msg, extra } = CrowdBfExplorer.parseCIP674(order);
+			const lowerMsg = msg.map((s: any) => String(s).toLowerCase());
+			const isAgg = lowerMsg.some((s: string) => s.includes('aggregator market order'));
+			const isExec = lowerMsg.some((s: string) => s.includes('order executed'));
+
+			if (isAgg && extra) {
+				const opt = CrowdBfExplorer.extractOrderOptions(extra);
+				if (opt?.amountIn && opt?.assetIn && opt?.assetOut) {
+					pending.push({
+						ts: new Date(order.timestamp).getTime(),
+						txid: order.txHash,
+						assetIn: opt.assetIn,
+						assetOut: opt.assetOut,
+						amountIn: opt.amountIn,
+					});
+				}
+				continue;
+			}
+
+			if (isExec) {
+				const ts = new Date(order.timestamp).getTime();
+				const candidates = pending
+					.filter((p: any) => ts - p.ts >= 0 && ts - p.ts <= 10 * 60 * 1000)
+					.sort((a: any, b: any) => b.ts - a.ts);
+
+				if (!candidates.length) continue;
+
+				const delivered = CrowdBfExplorer.tokensReceived(order, walletAddress, undefined);
+				let pair = candidates[0];
+
+				if (delivered) {
+					const byUnit = candidates.find((p: any) => CrowdBfExplorer.sameUnit(p.assetOut, delivered.unit));
+					if (byUnit) pair = byUnit;
+				}
+
+				const idx = pending.indexOf(pair);
+				if (idx >= 0) pending.splice(idx, 1);
+
+				// BUY (ADA -> token)
+				if (pair.assetIn === 'lovelace' && delivered) {
+					const adaIn = CrowdBfExplorer.toAda(pair.amountIn);
+					const tokenOut = Number(delivered.qty);
+
+					if (adaIn != null && Number.isFinite(tokenOut) && tokenOut > 0) {
+						const identifier = CrowdBfExplorer.normalizeIdentifier(delivered.unit);
+						const assetName = CrowdBfExplorer.decodeAssetNameFromIdentifier(identifier);
+						const rawPrice = adaIn / tokenOut; // ADA per token
+
+						trades.push({
+							timestamp: order.timestamp,
+							direction: "BUY",
+							assetName,
+							identifier,
+							amountIn: CrowdBfExplorer.formatNum6(adaIn),
+							amountOut: CrowdBfExplorer.formatNum6(tokenOut),
+							price: CrowdBfExplorer.formatPrice6(rawPrice),
+							txHash: order.txHash,
+						});
+					}
+					continue;
+				}
+
+				// SELL (token -> ADA)
+				if (pair.assetIn !== 'lovelace') {
+					let lovelaceToWallet = 0;
+					for (const o of (order.outputs || [])) {
+						if (o?.address === walletAddress) {
+							for (const a of (o.amount || [])) {
+								if (a.unit === 'lovelace') {
+									lovelaceToWallet += Number(a.quantity || '0');
+								}
+							}
+						}
+					}
+
+					const adaOut = CrowdBfExplorer.toAda(String(lovelaceToWallet));
+					const tokenIn = Number(pair.amountIn);
+
+					if (adaOut != null && Number.isFinite(tokenIn) && tokenIn > 0) {
+						const identifier = CrowdBfExplorer.normalizeIdentifier(pair.assetIn);
+						const assetName = CrowdBfExplorer.decodeAssetNameFromIdentifier(identifier);
+						const rawPrice = adaOut / tokenIn; // ADA per token
+
+						trades.push({
+							timestamp: order.timestamp,
+							direction: "SELL",
+							assetName,
+							identifier,
+							amountIn: CrowdBfExplorer.formatNum6(tokenIn),
+							amountOut: CrowdBfExplorer.formatNum6(adaOut),
+							price: CrowdBfExplorer.formatPrice6(rawPrice),
+							txHash: order.txHash,
+						});
+					}
+				}
+			}
+		}
+
+		return {
+			trades,
+			summary: {
+				totalTrades: trades.length,
+				buyTrades: trades.filter(t => t.direction === 'BUY').length,
+				sellTrades: trades.filter(t => t.direction === 'SELL').length,
+				ordersScanned: orders.length,
+				transactionsScanned: orderHistory.transactionsScanned,
+			}
+		};
+	}
+
+	/**
+	 * Parse CIP-674 metadata
+	 */
+	private static parseCIP674(order: any) {
+		const row = (order?.metadata || []).find((m: any) => m?.label === '674' && m?.json_metadata);
+		if (!row) return { msg: [], extra: null };
+
+		const msg = Array.isArray(row.json_metadata?.msg) ? row.json_metadata.msg : [];
+		let extra = null;
+		const ed = row.json_metadata?.extraData;
+
+		if (Array.isArray(ed) && ed.length) {
+			try {
+				extra = JSON.parse(ed.join(''));
+			} catch {
+				// Invalid JSON in extraData
+			}
+		}
+
+		return { msg, extra };
+	}
+
+	/**
+	 * Extract order options from CIP-674 extra data
+	 */
+	private static extractOrderOptions(extra: any) {
+		if (!extra?.orderOptions?.length) return null;
+		const opt = extra.orderOptions[0];
+		const big = (k: string) => opt?.[k]?.$bigint ?? null;
+
+		return {
+			assetIn: opt?.assetIn?.$asset || opt?.assetIn?.asset || opt?.assetIn?.unit || null,
+			assetOut: opt?.assetOut?.$asset || opt?.assetOut?.asset || opt?.assetOut?.unit || null,
+			amountIn: big('amountIn'),
+		};
+	}
+
+	/**
+	 * Check if two units are the same (handle different formats)
+	 */
+	private static sameUnit(u1: string, u2: string): boolean {
+		return !!u1 && !!u2 && (u1 === u2 || u1.replace('.', '') === u2.replace('.', ''));
+	}
+
+	/**
+	 * Find tokens received by wallet in transaction outputs
+	 */
+	private static tokensReceived(order: any, walletAddr: string, expectedUnit?: string) {
+		for (const o of (order.outputs || [])) {
+			if (o?.address !== walletAddr) continue;
+			for (const a of (o.amount || [])) {
+				if (a.unit !== 'lovelace' && (!expectedUnit || CrowdBfExplorer.sameUnit(a.unit, expectedUnit))) {
+					return { unit: a.unit, qty: Number(a.quantity) };
+				}
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Normalize asset identifier format
+	 */
+	private static normalizeIdentifier(unit: string): string {
+		if (!unit || unit === 'lovelace') return 'lovelace';
+		if (unit.includes('.')) return unit;
+		if (unit.length > 56) {
+			const policy = unit.slice(0, 56);
+			const assetHex = unit.slice(56);
+			return `${policy}.${assetHex}`;
+		}
+		return unit;
+	}
+
+	/**
+	 * Decode asset name from identifier
+	 */
+	private static decodeAssetNameFromIdentifier(identifier: string): string {
+		if (identifier === 'lovelace') return 'ADA';
+		const parts = identifier.split('.');
+		if (parts.length !== 2) return identifier;
+		const assetHex = parts[1];
+
+		try {
+			const buf = Buffer.from(assetHex, 'hex');
+			const ascii = buf.toString('utf8');
+			if (/^[\x20-\x7E]+$/.test(ascii)) return ascii;
+		} catch {
+			// Failed to decode
+		}
+
+		return identifier;
+	}
+
+	/**
+	 * Convert lovelace to ADA
+	 */
+	private static toAda(lovelaceStr: string): number | null {
+		const n = Number(lovelaceStr);
+		return Number.isFinite(n) ? n / 1e6 : null;
+	}
+
+	/**
+	 * Format number to 6 decimal places
+	 */
+	private static formatNum6(n: number): string {
+		return Number(n).toFixed(6);
+	}
+
+	/**
+	 * Format price to 6 decimal places
+	 */
+	private static formatPrice6(p: number): string {
+		return Number(p).toFixed(6);
 	}
 
 	/**
