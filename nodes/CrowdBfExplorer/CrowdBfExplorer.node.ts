@@ -9,6 +9,22 @@ import {
 
 import { BlockFrostAPI } from '@blockfrost/blockfrost-js';
 
+interface BlockfrostAssetResponse {
+	policy_id: string;
+	asset_name: string;
+	fingerprint: string;
+	quantity: string;
+	initial_mint_tx_hash: string;
+	mint_or_burn_count: number;
+	onchain_metadata: any;
+	metadata: any;
+}
+
+interface BlockfrostAddressResponse {
+	address: string;
+	quantity: string;
+}
+
 export class CrowdBfExplorer implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Crowd BF Explorer',
@@ -61,6 +77,11 @@ export class CrowdBfExplorer implements INodeType {
 						value: 'getLatestDexTrade',
 						description: 'Get the most recent DEX trade from last 10 transactions',
 					},
+					{
+						name: 'Resolve ADA Handle',
+						value: 'resolveAdaHandle',
+						description: 'Resolve ADA handle to blockchain address',
+					},
 				],
 				default: 'getAddressInfo',
 			},
@@ -70,7 +91,7 @@ export class CrowdBfExplorer implements INodeType {
 				type: 'options',
 				displayOptions: {
 					show: {
-						operation: ['getAddressInfo', 'getTransaction', 'getRecentOrders', 'parseTradingHistory'],
+						operation: ['getAddressInfo', 'getTransaction', 'getRecentOrders', 'parseTradingHistory', 'resolveAdaHandle'],
 					},
 				},
 				options: [
@@ -83,7 +104,7 @@ export class CrowdBfExplorer implements INodeType {
 						value: 'testnet',
 					},
 				],
-				default: 'testnet',
+				default: 'mainnet',
 				description: 'Cardano network to use',
 			},
 			{
@@ -99,6 +120,32 @@ export class CrowdBfExplorer implements INodeType {
 				required: true,
 				description: 'Cardano address to query',
 				placeholder: 'addr1qxy...',
+			},
+			{
+				displayName: 'Handle Name',
+				name: 'handleName',
+				type: 'string',
+				displayOptions: {
+					show: {
+						operation: ['resolveAdaHandle'],
+					},
+				},
+				default: '',
+				required: true,
+				placeholder: '$spitzer or spitzer',
+				description: 'The ADA handle name to resolve (with or without $ prefix, e.g., "$spitzer" or "spitzer")',
+			},
+			{
+				displayName: 'Include Metadata',
+				name: 'includeMetadata',
+				type: 'boolean',
+				displayOptions: {
+					show: {
+						operation: ['resolveAdaHandle'],
+					},
+				},
+				default: false,
+				description: 'Whether to include additional metadata in the response',
 			},
 			{
 				displayName: 'Limit',
@@ -190,7 +237,40 @@ export class CrowdBfExplorer implements INodeType {
 					customBackend: blockfrostUrl,
 				});
 
-				if (operation === 'getAddressInfo') {
+				if (operation === 'resolveAdaHandle') {
+					const handleName = this.getNodeParameter('handleName', i) as string;
+					const includeMetadata = this.getNodeParameter('includeMetadata', i) as boolean;
+
+					try {
+						const handleResult = await CrowdBfExplorer.resolveAdaHandle(
+							blockfrostApiKey,
+							handleName,
+							network,
+							includeMetadata
+						);
+
+						returnData.push({
+							json: {
+								operation: 'resolveAdaHandle',
+								network,
+								...handleResult,
+								success: true,
+							},
+						});
+					} catch (error: any) {
+						returnData.push({
+							json: {
+								operation: 'resolveAdaHandle',
+								network,
+								handleName,
+								success: false,
+								error: error.message,
+								cardanoAddress: null,
+							},
+						});
+					}
+
+				} else if (operation === 'getAddressInfo') {
 					const address = this.getNodeParameter('address', i) as string;
 
 					try {
@@ -388,6 +468,129 @@ export class CrowdBfExplorer implements INodeType {
 		}
 
 		return [returnData];
+	}
+
+	/**
+	 * Resolve ADA handle to blockchain address using Blockfrost
+	 */
+	private static async resolveAdaHandle(
+		blockfrostApiKey: string,
+		handleName: string,
+		network: string = 'mainnet',
+		includeMetadata: boolean = false
+	) {
+		if (!blockfrostApiKey) {
+			throw new Error('Blockfrost API key is required');
+		}
+
+		// Clean the handle name - remove $ prefix if present
+		let cleanHandleName = handleName.trim();
+		if (cleanHandleName.startsWith('$')) {
+			cleanHandleName = cleanHandleName.substring(1);
+		}
+
+		try {
+			// Convert clean handle name to hex for asset name
+			const handleHex = Buffer.from(cleanHandleName).toString('hex');
+			// ADA Handle policy ID
+			const policyId = 'f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a';
+			const assetId = `${policyId}${handleHex}`;
+
+			// Blockfrost endpoint for the specific asset
+			const blockfrostUrl = network === 'mainnet'
+				? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}`
+				: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}`;
+
+			const response = await fetch(blockfrostUrl, {
+				headers: {
+					'project_id': blockfrostApiKey,
+				},
+			});
+
+			if (response.ok) {
+				const assetData = await response.json() as BlockfrostAssetResponse;
+
+				// Get the asset addresses to find the current holder(s)
+				const addressesUrl = network === 'mainnet'
+					? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}/addresses`
+					: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}/addresses`;
+
+				const addressesResponse = await fetch(addressesUrl, {
+					headers: {
+						'project_id': blockfrostApiKey,
+					},
+				});
+
+				if (addressesResponse.ok) {
+					const addressesData = await addressesResponse.json() as BlockfrostAddressResponse[];
+
+					if (addressesData.length > 0) {
+						// Find the address that actually holds the handle (quantity > 0)
+						const activeHolders = addressesData.filter(addr =>
+							parseInt(addr.quantity) > 0
+						);
+
+						if (activeHolders.length === 0) {
+							throw new Error('Handle not found or no current holder');
+						}
+
+						// Get the primary holder (should be only one for a handle)
+						const holderAddress = activeHolders[0].address;
+						const holderQuantity = activeHolders[0].quantity;
+
+						const result: any = {
+							handleName,
+							cleanHandleName,
+							cardanoAddress: holderAddress,
+							status: 'success',
+						};
+
+						// If there are multiple active holders, include this info
+						if (activeHolders.length > 1) {
+							result.multipleHolders = true;
+							result.allHolders = activeHolders.map(holder => ({
+								address: holder.address,
+								quantity: holder.quantity
+							}));
+							result.note = `Handle has ${activeHolders.length} active holders. Primary holder returned.`;
+						}
+
+						if (includeMetadata) {
+							result.metadata = {
+								handleName,
+								cleanHandleName,
+								assetId,
+								policyId: assetData.policy_id,
+								fingerprint: assetData.fingerprint,
+								quantity: assetData.quantity,
+								holderQuantity: holderQuantity,
+								totalHolders: addressesData.length,
+								activeHolders: activeHolders.length,
+								initialMintTxHash: assetData.initial_mint_tx_hash,
+								mintOrBurnCount: assetData.mint_or_burn_count,
+								onchainMetadata: assetData.onchain_metadata,
+								resolvedAt: new Date().toISOString(),
+								network,
+							};
+						}
+
+						return result;
+					} else {
+						throw new Error('Handle not found or no addresses returned');
+					}
+				} else if (addressesResponse.status === 404) {
+					throw new Error('Handle exists but no holder addresses found');
+				} else {
+					throw new Error(`Failed to get handle addresses: ${addressesResponse.status} - ${addressesResponse.statusText}`);
+				}
+			} else if (response.status === 404) {
+				throw new Error('Handle not found');
+			} else {
+				throw new Error(`Blockfrost API error: ${response.status} - ${response.statusText}`);
+			}
+		} catch (error) {
+			throw new Error(`Failed to resolve ADA handle: ${(error as Error).message}`);
+		}
 	}
 
 	/**
