@@ -487,7 +487,120 @@ export class CrowdBfExplorer implements INodeType {
 			cleanHandleName = cleanHandleName.substring(1);
 		}
 
-		// Try multiple encoding approaches
+		// First try to find the handle by searching wallet assets
+		// This is more reliable than trying to guess encoding
+		try {
+			const result = await CrowdBfExplorer.findHandleByWalletAssets(blockfrostApiKey, cleanHandleName, network, includeMetadata);
+			if (result) return result;
+		} catch (error) {
+			// Continue to direct resolution if wallet search fails
+		}
+
+		// Fallback to direct asset resolution with multiple approaches
+		const isSubHandle = cleanHandleName.includes('@');
+
+		if (isSubHandle) {
+			return await CrowdBfExplorer.resolveSubHandle(blockfrostApiKey, cleanHandleName, network, includeMetadata);
+		} else {
+			return await CrowdBfExplorer.resolveRegularHandle(blockfrostApiKey, cleanHandleName, network, includeMetadata);
+		}
+	}
+
+	/**
+	 * Find handle by searching wallet assets - more reliable method
+	 */
+	private static async findHandleByWalletAssets(
+		blockfrostApiKey: string,
+		handleName: string,
+		network: string,
+		includeMetadata: boolean
+	) {
+		// This approach searches for the handle by checking assets with the known policy ID
+		// We'll get assets from the policy and decode them to find matching handles
+
+		const policyId = 'f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a';
+
+		try {
+			// Get assets from the ADA Handle policy
+			const policyUrl = network === 'mainnet'
+				? `https://cardano-mainnet.blockfrost.io/api/v0/assets/policy/${policyId}`
+				: `https://cardano-testnet.blockfrost.io/api/v0/assets/policy/${policyId}`;
+
+			// We'll try to search through paginated results
+			for (let page = 1; page <= 5; page++) { // Limit to 5 pages to avoid timeout
+				const response = await fetch(`${policyUrl}?page=${page}&count=100`, {
+					headers: {
+						'project_id': blockfrostApiKey,
+					},
+				});
+
+				if (!response.ok) {
+					if (page === 1) throw new Error(`Failed to fetch policy assets: ${response.status}`);
+					break; // Stop if we can't get more pages
+				}
+
+				const assets = await response.json();
+				if (!Array.isArray(assets) || assets.length === 0) break;
+
+				// Check each asset to see if it matches our handle
+				for (const asset of assets) {
+					try {
+						const assetName = asset.asset || asset.asset_name || asset;
+						if (typeof assetName === 'string' && assetName.startsWith(policyId)) {
+							const hexPart = assetName.substring(56); // Remove policy ID
+							const decodedName = CrowdBfExplorer.hexToString(hexPart);
+
+							if (decodedName === handleName) {
+								// Found a match! Now get the address
+								const result = await CrowdBfExplorer.tryResolveAsset(
+									blockfrostApiKey,
+									assetName,
+									handleName,
+									'found_in_policy',
+									network,
+									includeMetadata
+								);
+								if (result) return result;
+							}
+						}
+					} catch (error) {
+						// Skip assets that can't be decoded
+						continue;
+					}
+				}
+
+				// Add delay between pages to avoid rate limiting
+				await new Promise(resolve => setTimeout(resolve, 100));
+			}
+
+			return null; // Handle not found in policy assets
+		} catch (error) {
+			throw new Error(`Failed to search policy assets: ${(error as Error).message}`);
+		}
+	}
+
+	/**
+	 * Convert hex string to readable string
+	 */
+	private static hexToString(hex: string): string {
+		try {
+			const buffer = Buffer.from(hex, 'hex');
+			return buffer.toString('utf8');
+		} catch {
+			return '';
+		}
+	}
+
+	/**
+	 * Resolve regular ADA handle (no @ symbol)
+	 */
+	private static async resolveRegularHandle(
+		blockfrostApiKey: string,
+		cleanHandleName: string,
+		network: string,
+		includeMetadata: boolean
+	) {
+		// Try multiple encoding approaches and policy IDs for regular handles
 		const encodingAttempts = [
 			{
 				name: 'utf8',
@@ -500,119 +613,225 @@ export class CrowdBfExplorer implements INodeType {
 			{
 				name: 'latin1',
 				hex: Buffer.from(cleanHandleName, 'latin1').toString('hex')
+			},
+			{
+				name: 'hex_direct',
+				hex: cleanHandleName // Try if it's already hex
 			}
 		];
 
-		const policyId = 'f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a';
+		// Try multiple policy IDs in case there are different versions
+		const policyIds = [
+			'f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a', // Standard ADA Handle policy
+			'000de140000de1404000de1404000de1404000de1404000de1404000', // Alternative policy (if exists)
+		];
 
-		for (const encoding of encodingAttempts) {
-			try {
-				const assetId = `${policyId}${encoding.hex}`;
+		for (const policyId of policyIds) {
+			for (const encoding of encodingAttempts) {
+				try {
+					const assetId = `${policyId}${encoding.hex}`;
+					const result = await CrowdBfExplorer.tryResolveAsset(blockfrostApiKey, assetId, cleanHandleName, encoding.name, network, includeMetadata);
+					if (result) return result;
+				} catch (error) {
+					continue;
+				}
+			}
+		}
 
-				const debugInfo = {
-					originalHandle: handleName,
-					cleanHandleName,
-					encoding: encoding.name,
-					handleHex: encoding.hex,
-					assetId,
-					policyId
-				};
+		throw new Error(`Regular handle not found with any encoding method. Tried: ${encodingAttempts.map(e =>
+			`${e.name} (${e.hex})`
+		).join(', ')}. Handle: ${cleanHandleName}`);
+	}
 
-				// Blockfrost endpoint for the specific asset
-				const blockfrostUrl = network === 'mainnet'
-					? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}`
-					: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}`;
+	/**
+	 * Resolve subHandle (contains @ symbol)
+	 */
+	private static async resolveSubHandle(
+		blockfrostApiKey: string,
+		cleanHandleName: string,
+		network: string,
+		includeMetadata: boolean
+	) {
+		// For subHandles, try multiple encoding approaches
+		const encodingAttempts = [
+			{
+				name: 'utf8',
+				hex: Buffer.from(cleanHandleName, 'utf8').toString('hex')
+			},
+			{
+				name: 'ascii',
+				hex: Buffer.from(cleanHandleName, 'ascii').toString('hex')
+			},
+			{
+				name: 'parts_utf8',
+				hex: CrowdBfExplorer.encodeSubHandleParts(cleanHandleName, 'utf8')
+			},
+			{
+				name: 'parts_ascii',
+				hex: CrowdBfExplorer.encodeSubHandleParts(cleanHandleName, 'ascii')
+			}
+		];
 
-				const response = await fetch(blockfrostUrl, {
+		// Try the standard policy ID and potential subHandle-specific policies
+		const policyIds = [
+			'f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a', // Standard ADA Handle policy
+			// Add subHandle-specific policy IDs here when known
+		];
+
+		for (const policyId of policyIds) {
+			for (const encoding of encodingAttempts) {
+				if (!encoding.hex) continue;
+
+				try {
+					const assetId = `${policyId}${encoding.hex}`;
+					const result = await CrowdBfExplorer.tryResolveAsset(blockfrostApiKey, assetId, cleanHandleName, encoding.name, network, includeMetadata);
+					if (result) {
+						result.isSubHandle = true;
+						return result;
+					}
+				} catch (error) {
+					continue;
+				}
+			}
+		}
+
+		throw new Error(`SubHandle not found with any encoding method. Tried: ${encodingAttempts.filter(e => e.hex).map(e =>
+			`${e.name} (${e.hex})`
+		).join(', ')}. SubHandle: ${cleanHandleName}. Note: SubHandles may use different policy IDs not yet discovered.`);
+	}
+
+	/**
+	 * Try encoding subHandle parts separately
+	 */
+	private static encodeSubHandleParts(subHandle: string, encoding: BufferEncoding): string | null {
+		try {
+			const parts = subHandle.split('@');
+			if (parts.length !== 2) return null;
+
+			const [name, domain] = parts;
+			// Try different combinations for subHandle encoding
+			const combinations = [
+				`${Buffer.from(name, encoding).toString('hex')}40${Buffer.from(domain, encoding).toString('hex')}`, // @ = 40 in hex
+				`${Buffer.from(name, encoding).toString('hex')}2d${Buffer.from(domain, encoding).toString('hex')}`, // Try dash (2d)
+				`${Buffer.from(name, encoding).toString('hex')}5f${Buffer.from(domain, encoding).toString('hex')}`, // Try underscore (5f)
+				`${Buffer.from(name, encoding).toString('hex')}2e${Buffer.from(domain, encoding).toString('hex')}`, // Try period (2e)
+			];
+
+			return combinations[0]; // Return the first attempt (@ symbol)
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Try to resolve a specific asset ID
+	 */
+	private static async tryResolveAsset(
+		blockfrostApiKey: string,
+		assetId: string,
+		handleName: string,
+		encoding: string,
+		network: string,
+		includeMetadata: boolean
+	) {
+		const debugInfo = {
+			originalHandle: handleName,
+			encoding: encoding,
+			handleHex: assetId.length > 56 ? assetId.substring(56) : assetId,
+			assetId,
+			policyId: assetId.length > 56 ? assetId.substring(0, 56) : 'unknown'
+		};
+
+		try {
+			// Blockfrost endpoint for the specific asset
+			const blockfrostUrl = network === 'mainnet'
+				? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}`
+				: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}`;
+
+			const response = await fetch(blockfrostUrl, {
+				headers: {
+					'project_id': blockfrostApiKey,
+				},
+			});
+
+			if (response.ok) {
+				const assetData = await response.json() as BlockfrostAssetResponse;
+
+				// Get the asset addresses to find the current holder(s)
+				const addressesUrl = network === 'mainnet'
+					? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}/addresses`
+					: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}/addresses`;
+
+				const addressesResponse = await fetch(addressesUrl, {
 					headers: {
 						'project_id': blockfrostApiKey,
 					},
 				});
 
-				if (response.ok) {
-					const assetData = await response.json() as BlockfrostAssetResponse;
+				if (addressesResponse.ok) {
+					const addressesData = await addressesResponse.json() as BlockfrostAddressResponse[];
 
-					// Get the asset addresses to find the current holder(s)
-					const addressesUrl = network === 'mainnet'
-						? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}/addresses`
-						: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}/addresses`;
+					if (addressesData.length > 0) {
+						// Find the address that actually holds the handle (quantity > 0)
+						const activeHolders = addressesData.filter(addr =>
+							parseInt(addr.quantity) > 0
+						);
 
-					const addressesResponse = await fetch(addressesUrl, {
-						headers: {
-							'project_id': blockfrostApiKey,
-						},
-					});
-
-					if (addressesResponse.ok) {
-						const addressesData = await addressesResponse.json() as BlockfrostAddressResponse[];
-
-						if (addressesData.length > 0) {
-							// Find the address that actually holds the handle (quantity > 0)
-							const activeHolders = addressesData.filter(addr =>
-								parseInt(addr.quantity) > 0
-							);
-
-							if (activeHolders.length === 0) {
-								continue; // Try next encoding
-							}
-
-							// Get the primary holder (should be only one for a handle)
-							const holderAddress = activeHolders[0].address;
-							const holderQuantity = activeHolders[0].quantity;
-
-							const result: any = {
-								handleName,
-								cleanHandleName,
-								cardanoAddress: holderAddress,
-								status: 'success',
-								resolvedWith: encoding.name,
-							};
-
-							// If there are multiple active holders, include this info
-							if (activeHolders.length > 1) {
-								result.multipleHolders = true;
-								result.allHolders = activeHolders.map(holder => ({
-									address: holder.address,
-									quantity: holder.quantity
-								}));
-								result.note = `Handle has ${activeHolders.length} active holders. Primary holder returned.`;
-							}
-
-							if (includeMetadata) {
-								result.metadata = {
-									handleName,
-									cleanHandleName,
-									assetId,
-									policyId: assetData.policy_id,
-									fingerprint: assetData.fingerprint,
-									quantity: assetData.quantity,
-									holderQuantity: holderQuantity,
-									totalHolders: addressesData.length,
-									activeHolders: activeHolders.length,
-									initialMintTxHash: assetData.initial_mint_tx_hash,
-									mintOrBurnCount: assetData.mint_or_burn_count,
-									onchainMetadata: assetData.onchain_metadata,
-									resolvedAt: new Date().toISOString(),
-									network,
-									debug: debugInfo
-								};
-							}
-
-							return result;
+						if (activeHolders.length === 0) {
+							return null; // No active holders, try next approach
 						}
+
+						// Get the primary holder (should be only one for a handle)
+						const holderAddress = activeHolders[0].address;
+						const holderQuantity = activeHolders[0].quantity;
+
+						const result: any = {
+							handleName,
+							cleanHandleName: handleName,
+							cardanoAddress: holderAddress,
+							status: 'success',
+							resolvedWith: encoding,
+						};
+
+						// If there are multiple active holders, include this info
+						if (activeHolders.length > 1) {
+							result.multipleHolders = true;
+							result.allHolders = activeHolders.map(holder => ({
+								address: holder.address,
+								quantity: holder.quantity
+							}));
+							result.note = `Handle has ${activeHolders.length} active holders. Primary holder returned.`;
+						}
+
+						if (includeMetadata) {
+							result.metadata = {
+								handleName,
+								cleanHandleName: handleName,
+								assetId,
+								policyId: assetData.policy_id,
+								fingerprint: assetData.fingerprint,
+								quantity: assetData.quantity,
+								holderQuantity: holderQuantity,
+								totalHolders: addressesData.length,
+								activeHolders: activeHolders.length,
+								initialMintTxHash: assetData.initial_mint_tx_hash,
+								mintOrBurnCount: assetData.mint_or_burn_count,
+								onchainMetadata: assetData.onchain_metadata,
+								resolvedAt: new Date().toISOString(),
+								network,
+								debug: debugInfo
+							};
+						}
+
+						return result;
 					}
 				}
-				// If 404, try next encoding
-			} catch (error) {
-				// Continue to next encoding attempt
-				continue;
 			}
+		} catch (error) {
+			// Continue to next attempt
 		}
 
-		// If all encoding attempts failed, throw detailed error
-		throw new Error(`Handle not found with any encoding method. Tried: ${encodingAttempts.map(e =>
-			`${e.name} (${e.hex})`
-		).join(', ')}. Handle: ${cleanHandleName}`);
+		return null; // Asset not found or not accessible
 	}
 
 	/**
