@@ -227,16 +227,6 @@ export class CrowdBfExplorer implements INodeType {
 				const operation = this.getNodeParameter('operation', i) as string;
 				const network = this.getNodeParameter('network', i) as string;
 
-				// Initialize Blockfrost API
-				const blockfrostUrl = network === 'mainnet'
-					? 'https://cardano-mainnet.blockfrost.io/api/v0'
-					: 'https://cardano-testnet.blockfrost.io/api/v0';
-
-				const blockfrost = new BlockFrostAPI({
-					projectId: blockfrostApiKey,
-					customBackend: blockfrostUrl,
-				});
-
 				if (operation === 'resolveAdaHandle') {
 					const handleName = this.getNodeParameter('handleName', i) as string;
 					const includeMetadata = this.getNodeParameter('includeMetadata', i) as boolean;
@@ -269,8 +259,20 @@ export class CrowdBfExplorer implements INodeType {
 							},
 						});
 					}
+					continue;
+				}
 
-				} else if (operation === 'getAddressInfo') {
+				// Initialize Blockfrost API for other operations
+				const blockfrostUrl = network === 'mainnet'
+					? 'https://cardano-mainnet.blockfrost.io/api/v0'
+					: 'https://cardano-testnet.blockfrost.io/api/v0';
+
+				const blockfrost = new BlockFrostAPI({
+					projectId: blockfrostApiKey,
+					customBackend: blockfrostUrl,
+				});
+
+				if (operation === 'getAddressInfo') {
 					const address = this.getNodeParameter('address', i) as string;
 
 					try {
@@ -386,10 +388,6 @@ export class CrowdBfExplorer implements INodeType {
 						});
 					}
 
-				} else if (operation === 'getLatestDexTrade') {
-					// This should not be reached since getLatestDexTrade is handled above
-					throw new NodeOperationError(this.getNode(), 'getLatestDexTrade operation should be handled at the beginning of execute()');
-
 				} else if (operation === 'getTransaction') {
 					const transactionHash = this.getNodeParameter('transactionHash', i) as string;
 
@@ -489,108 +487,132 @@ export class CrowdBfExplorer implements INodeType {
 			cleanHandleName = cleanHandleName.substring(1);
 		}
 
-		try {
-			// Convert clean handle name to hex for asset name
-			const handleHex = Buffer.from(cleanHandleName).toString('hex');
-			// ADA Handle policy ID
-			const policyId = 'f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a';
-			const assetId = `${policyId}${handleHex}`;
+		// Try multiple encoding approaches
+		const encodingAttempts = [
+			{
+				name: 'utf8',
+				hex: Buffer.from(cleanHandleName, 'utf8').toString('hex')
+			},
+			{
+				name: 'ascii',
+				hex: Buffer.from(cleanHandleName, 'ascii').toString('hex')
+			},
+			{
+				name: 'latin1',
+				hex: Buffer.from(cleanHandleName, 'latin1').toString('hex')
+			}
+		];
 
-			// Blockfrost endpoint for the specific asset
-			const blockfrostUrl = network === 'mainnet'
-				? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}`
-				: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}`;
+		const policyId = 'f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a';
 
-			const response = await fetch(blockfrostUrl, {
-				headers: {
-					'project_id': blockfrostApiKey,
-				},
-			});
+		for (const encoding of encodingAttempts) {
+			try {
+				const assetId = `${policyId}${encoding.hex}`;
 
-			if (response.ok) {
-				const assetData = await response.json() as BlockfrostAssetResponse;
+				const debugInfo = {
+					originalHandle: handleName,
+					cleanHandleName,
+					encoding: encoding.name,
+					handleHex: encoding.hex,
+					assetId,
+					policyId
+				};
 
-				// Get the asset addresses to find the current holder(s)
-				const addressesUrl = network === 'mainnet'
-					? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}/addresses`
-					: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}/addresses`;
+				// Blockfrost endpoint for the specific asset
+				const blockfrostUrl = network === 'mainnet'
+					? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}`
+					: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}`;
 
-				const addressesResponse = await fetch(addressesUrl, {
+				const response = await fetch(blockfrostUrl, {
 					headers: {
 						'project_id': blockfrostApiKey,
 					},
 				});
 
-				if (addressesResponse.ok) {
-					const addressesData = await addressesResponse.json() as BlockfrostAddressResponse[];
+				if (response.ok) {
+					const assetData = await response.json() as BlockfrostAssetResponse;
 
-					if (addressesData.length > 0) {
-						// Find the address that actually holds the handle (quantity > 0)
-						const activeHolders = addressesData.filter(addr =>
-							parseInt(addr.quantity) > 0
-						);
+					// Get the asset addresses to find the current holder(s)
+					const addressesUrl = network === 'mainnet'
+						? `https://cardano-mainnet.blockfrost.io/api/v0/assets/${assetId}/addresses`
+						: `https://cardano-testnet.blockfrost.io/api/v0/assets/${assetId}/addresses`;
 
-						if (activeHolders.length === 0) {
-							throw new Error('Handle not found or no current holder');
-						}
+					const addressesResponse = await fetch(addressesUrl, {
+						headers: {
+							'project_id': blockfrostApiKey,
+						},
+					});
 
-						// Get the primary holder (should be only one for a handle)
-						const holderAddress = activeHolders[0].address;
-						const holderQuantity = activeHolders[0].quantity;
+					if (addressesResponse.ok) {
+						const addressesData = await addressesResponse.json() as BlockfrostAddressResponse[];
 
-						const result: any = {
-							handleName,
-							cleanHandleName,
-							cardanoAddress: holderAddress,
-							status: 'success',
-						};
+						if (addressesData.length > 0) {
+							// Find the address that actually holds the handle (quantity > 0)
+							const activeHolders = addressesData.filter(addr =>
+								parseInt(addr.quantity) > 0
+							);
 
-						// If there are multiple active holders, include this info
-						if (activeHolders.length > 1) {
-							result.multipleHolders = true;
-							result.allHolders = activeHolders.map(holder => ({
-								address: holder.address,
-								quantity: holder.quantity
-							}));
-							result.note = `Handle has ${activeHolders.length} active holders. Primary holder returned.`;
-						}
+							if (activeHolders.length === 0) {
+								continue; // Try next encoding
+							}
 
-						if (includeMetadata) {
-							result.metadata = {
+							// Get the primary holder (should be only one for a handle)
+							const holderAddress = activeHolders[0].address;
+							const holderQuantity = activeHolders[0].quantity;
+
+							const result: any = {
 								handleName,
 								cleanHandleName,
-								assetId,
-								policyId: assetData.policy_id,
-								fingerprint: assetData.fingerprint,
-								quantity: assetData.quantity,
-								holderQuantity: holderQuantity,
-								totalHolders: addressesData.length,
-								activeHolders: activeHolders.length,
-								initialMintTxHash: assetData.initial_mint_tx_hash,
-								mintOrBurnCount: assetData.mint_or_burn_count,
-								onchainMetadata: assetData.onchain_metadata,
-								resolvedAt: new Date().toISOString(),
-								network,
+								cardanoAddress: holderAddress,
+								status: 'success',
+								resolvedWith: encoding.name,
 							};
-						}
 
-						return result;
-					} else {
-						throw new Error('Handle not found or no addresses returned');
+							// If there are multiple active holders, include this info
+							if (activeHolders.length > 1) {
+								result.multipleHolders = true;
+								result.allHolders = activeHolders.map(holder => ({
+									address: holder.address,
+									quantity: holder.quantity
+								}));
+								result.note = `Handle has ${activeHolders.length} active holders. Primary holder returned.`;
+							}
+
+							if (includeMetadata) {
+								result.metadata = {
+									handleName,
+									cleanHandleName,
+									assetId,
+									policyId: assetData.policy_id,
+									fingerprint: assetData.fingerprint,
+									quantity: assetData.quantity,
+									holderQuantity: holderQuantity,
+									totalHolders: addressesData.length,
+									activeHolders: activeHolders.length,
+									initialMintTxHash: assetData.initial_mint_tx_hash,
+									mintOrBurnCount: assetData.mint_or_burn_count,
+									onchainMetadata: assetData.onchain_metadata,
+									resolvedAt: new Date().toISOString(),
+									network,
+									debug: debugInfo
+								};
+							}
+
+							return result;
+						}
 					}
-				} else if (addressesResponse.status === 404) {
-					throw new Error('Handle exists but no holder addresses found');
-				} else {
-					throw new Error(`Failed to get handle addresses: ${addressesResponse.status} - ${addressesResponse.statusText}`);
 				}
-			} else if (response.status === 404) {
-				throw new Error('Handle not found');
-			} else {
-				throw new Error(`Blockfrost API error: ${response.status} - ${response.statusText}`);
+				// If 404, try next encoding
+			} catch (error) {
+				// Continue to next encoding attempt
+				continue;
 			}
-		} catch (error) {
-			throw new Error(`Failed to resolve ADA handle: ${(error as Error).message}`);
 		}
+
+		// If all encoding attempts failed, throw detailed error
+		throw new Error(`Handle not found with any encoding method. Tried: ${encodingAttempts.map(e =>
+			`${e.name} (${e.hex})`
+		).join(', ')}. Handle: ${cleanHandleName}`);
 	}
 
 	/**
