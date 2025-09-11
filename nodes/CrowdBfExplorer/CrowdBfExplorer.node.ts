@@ -388,6 +388,7 @@ export class CrowdBfExplorer implements INodeType {
 
 /**
 /**
+/**
  * Parse trading history from raw order data - handles DEX aggregation
  */
 private static parseTradingHistory(orderHistory: any, walletAddress: string) {
@@ -672,16 +673,14 @@ private static processFinalTrade(order: any, walletAddress: string) {
 		return total;
 	}, { unit: null, qty: 0 });
 
-	// Calculate total ADA received (for SELL orders)
+	// Calculate total ADA received from ALL executions (for both BUY and SELL orders)
 	let totalAdaReceived = 0;
-	if (order.orderType === 'sell') {
-		for (const exec of order.executions) {
-			for (const output of (exec.order.outputs || [])) {
-				if (output.address === walletAddress) {
-					for (const amount of (output.amount || [])) {
-						if (amount.unit === 'lovelace') {
-							totalAdaReceived += parseInt(amount.quantity || '0');
-						}
+	for (const exec of order.executions) {
+		for (const output of (exec.order.outputs || [])) {
+			if (output.address === walletAddress) {
+				for (const amount of (output.amount || [])) {
+					if (amount.unit === 'lovelace') {
+						totalAdaReceived += parseInt(amount.quantity || '0');
 					}
 				}
 			}
@@ -693,7 +692,7 @@ private static processFinalTrade(order: any, walletAddress: string) {
 	const firstExecution = order.executions[0];
 
 	if (order.assetIn === 'lovelace' && totalDelivered.unit && totalDelivered.qty > 0) {
-		// BUY trade
+		// BUY trade (ADA → tokens)
 		const adaIn = CrowdBfExplorer.toAda(order.amountIn);
 		const tokenOut = totalDelivered.qty;
 
@@ -717,7 +716,7 @@ private static processFinalTrade(order: any, walletAddress: string) {
 			};
 		}
 	} else if (order.assetIn !== 'lovelace' && totalAdaReceived > 0) {
-		// SELL trade
+		// SELL trade (tokens → ADA)
 		const tokenIn = Number(order.amountIn);
 		const adaOut = CrowdBfExplorer.toAda(String(totalAdaReceived));
 
@@ -734,6 +733,32 @@ private static processFinalTrade(order: any, walletAddress: string) {
 				amountIn: CrowdBfExplorer.formatNum6(tokenIn),
 				amountOut: CrowdBfExplorer.formatNum6(adaOut),
 				price: CrowdBfExplorer.formatPrice6(rawPrice),
+				txHash: order.txid,
+				executionCount: order.executions.length,
+				platforms: platforms.join(', '),
+				executionHashes: order.executions.map((e: any) => e.txHash),
+			};
+		}
+	} else if (order.assetIn !== 'lovelace' && order.assetOut && order.assetOut !== 'lovelace' && order.assetOut !== 'unknown') {
+		// Token-to-token swap
+		const tokenIn = Number(order.amountIn);
+		const tokenOut = totalDelivered.qty;
+
+		if (Number.isFinite(tokenIn) && tokenIn > 0 && Number.isFinite(tokenOut) && tokenOut > 0) {
+			const identifierIn = CrowdBfExplorer.normalizeIdentifier(order.assetIn);
+			const assetNameIn = CrowdBfExplorer.decodeAssetNameFromIdentifier(identifierIn);
+			const identifierOut = CrowdBfExplorer.normalizeIdentifier(totalDelivered.unit);
+			const assetNameOut = CrowdBfExplorer.decodeAssetNameFromIdentifier(identifierOut);
+			const exchangeRate = tokenOut / tokenIn;
+
+			return {
+				timestamp: firstExecution.timestamp,
+				direction: "SWAP",
+				assetName: `${assetNameIn} → ${assetNameOut}`,
+				identifier: identifierOut,
+				amountIn: CrowdBfExplorer.formatNum6(tokenIn),
+				amountOut: CrowdBfExplorer.formatNum6(tokenOut),
+				price: CrowdBfExplorer.formatPrice6(exchangeRate),
 				txHash: order.txid,
 				executionCount: order.executions.length,
 				platforms: platforms.join(', '),
