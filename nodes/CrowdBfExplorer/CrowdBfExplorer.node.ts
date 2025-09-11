@@ -386,128 +386,511 @@ export class CrowdBfExplorer implements INodeType {
 		return [returnData];
 	}
 
-	/**
-	 * Parse trading history from raw order data
-	 */
-	private static parseTradingHistory(orderHistory: any, walletAddress: string) {
-		const orders = [...(orderHistory?.orders || [])].sort((a: any, b: any) =>
-			new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-		);
+/**
+/**
+ * Parse trading history from raw order data - handles DEX aggregation
+ */
+private static parseTradingHistory(orderHistory: any, walletAddress: string) {
+	const orders = [...(orderHistory?.orders || [])].sort((a: any, b: any) =>
+		new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+	);
 
-		const pending: any[] = [];
-		const trades: any[] = [];
+	const pending: any[] = [];
+	const trades: any[] = [];
+	const processedOrders = new Set<string>(); // Track processed order IDs
 
-		for (const order of orders) {
-			const { msg, extra } = CrowdBfExplorer.parseCIP674(order);
-			const lowerMsg = msg.map((s: any) => String(s).toLowerCase());
-			const isAgg = lowerMsg.some((s: string) => s.includes('aggregator market order'));
-			const isExec = lowerMsg.some((s: string) => s.includes('order executed'));
+	console.log(`Processing ${orders.length} orders for wallet ${walletAddress}`);
 
-			if (isAgg && extra) {
-				const opt = CrowdBfExplorer.extractOrderOptions(extra);
-				if (opt?.amountIn && opt?.assetIn && opt?.assetOut) {
-					pending.push({
-						ts: new Date(order.timestamp).getTime(),
-						txid: order.txHash,
-						assetIn: opt.assetIn,
-						assetOut: opt.assetOut,
-						amountIn: opt.amountIn,
-					});
+	for (const order of orders) {
+		if (processedOrders.has(order.txHash)) continue;
+
+		const { msg, extra } = CrowdBfExplorer.parseCIP674(order);
+		const lowerMsg = msg.map((s: any) => String(s).toLowerCase());
+
+		const isAgg = lowerMsg.some((s: string) => s.includes('aggregator market order'));
+		const isExec = lowerMsg.some((s: string) => s.includes('order executed'));
+		const isDexhunterTrade = lowerMsg.some((s: string) => s.includes('dexhunter trade'));
+		const isSteelSwap = lowerMsg.some((s: string) => s.includes('steelswap'));
+		const isOrderPlacement = (isDexhunterTrade || isSteelSwap) && !isExec && !isAgg;
+
+		console.log(`Order ${order.txHash}: isAgg=${isAgg}, isExec=${isExec}, isDexhunter=${isDexhunterTrade}, isSteelSwap=${isSteelSwap}, isPlacement=${isOrderPlacement}`);
+
+		// Handle aggregator orders (existing logic)
+		if (isAgg && extra) {
+			console.log(`Processing aggregator order: ${order.txHash}`);
+			const opt = CrowdBfExplorer.extractOrderOptions(extra);
+			if (opt?.amountIn && opt?.assetIn && opt?.assetOut) {
+				pending.push({
+					ts: new Date(order.timestamp).getTime(),
+					txid: order.txHash,
+					assetIn: opt.assetIn,
+					assetOut: opt.assetOut,
+					amountIn: opt.amountIn,
+					executions: [],
+					isComplete: false,
+				});
+				console.log(`Added aggregator order to pending. Total pending: ${pending.length}`);
+			}
+			continue;
+		}
+
+		// Handle direct order placements (NEW)
+		if (isOrderPlacement) {
+			console.log(`Processing order placement: ${order.txHash}, platform: ${order.dexDetection?.platform}`);
+			const orderIntent = CrowdBfExplorer.extractOrderIntent(order, walletAddress);
+			console.log(`Order intent extracted:`, orderIntent);
+			if (orderIntent) {
+				pending.push({
+					ts: new Date(order.timestamp).getTime(),
+					txid: order.txHash,
+					assetIn: orderIntent.assetIn,
+					assetOut: orderIntent.assetOut,
+					amountIn: orderIntent.amountIn,
+					orderType: orderIntent.orderType,
+					executions: [],
+					isComplete: false,
+				});
+				console.log(`Added to pending orders. Total pending: ${pending.length}`);
+			}
+			continue;
+		}
+
+		// Handle order executions
+		if (isExec) {
+			console.log(`Processing execution: ${order.txHash}, looking for matching pending orders`);
+			const ts = new Date(order.timestamp).getTime();
+			const candidates = pending
+				.filter((p: any) => !p.isComplete && ts - p.ts >= 0 && ts - p.ts <= 10 * 60 * 1000)
+				.sort((a: any, b: any) => b.ts - a.ts);
+
+			console.log(`Found ${candidates.length} candidate pending orders for execution`);
+
+			if (candidates.length > 0) {
+				// Found matching placement order
+				const delivered = CrowdBfExplorer.tokensReceived(order, walletAddress, undefined);
+				let matchingOrder = candidates[0];
+
+				// Try to match by expected output asset
+				if (delivered) {
+					const byUnit = candidates.find((p: any) =>
+						CrowdBfExplorer.sameUnit(p.assetOut, delivered.unit)
+					);
+					if (byUnit) matchingOrder = byUnit;
 				}
-				continue;
+
+				console.log(`Matched execution ${order.txHash} with order ${matchingOrder.txid}`);
+
+				// Add this execution to the order
+				matchingOrder.executions.push({
+					txHash: order.txHash,
+					platform: order.dexDetection?.platform || 'Unknown',
+					timestamp: order.timestamp,
+					delivered: delivered,
+					order: order
+				});
+
+				// Check if this order is complete (heuristic: wait 2 minutes after last execution)
+				const isComplete = CrowdBfExplorer.isOrderComplete(matchingOrder, ts);
+				if (isComplete) {
+					matchingOrder.isComplete = true;
+					const trade = CrowdBfExplorer.processFinalTrade(matchingOrder, walletAddress);
+					if (trade) {
+						trades.push(trade);
+						console.log(`Completed trade created for order ${matchingOrder.txid}`);
+					}
+				}
+			} else {
+				// Orphaned execution - no matching placement found
+				console.log(`Orphaned execution detected: ${order.txHash}`);
+				const orphanedTrade = CrowdBfExplorer.processOrphanedExecution(order, walletAddress);
+				if (orphanedTrade) {
+					trades.push(orphanedTrade);
+					console.log(`Orphaned trade created: ${order.txHash}`);
+				}
 			}
 
-			if (isExec) {
-				const ts = new Date(order.timestamp).getTime();
-				const candidates = pending
-					.filter((p: any) => ts - p.ts >= 0 && ts - p.ts <= 10 * 60 * 1000)
-					.sort((a: any, b: any) => b.ts - a.ts);
+			processedOrders.add(order.txHash);
+			continue;
+		}
 
-				if (!candidates.length) continue;
+		// Handle other DEX transactions that don't fit the placement/execution pattern
+		if (!isAgg && !isExec && !isOrderPlacement) {
+			console.log(`Processing generic DEX transaction: ${order.txHash}`);
+			// Check if this looks like a standalone trade (SteelSwap, etc.)
+			const standaloneTrade = CrowdBfExplorer.processGenericDexTransaction(order, walletAddress);
+			if (standaloneTrade) {
+				trades.push(standaloneTrade);
+				console.log(`Standalone trade created: ${order.txHash}`);
+			}
+			processedOrders.add(order.txHash);
+		}
+	}
 
-				const delivered = CrowdBfExplorer.tokensReceived(order, walletAddress, undefined);
-				let pair = candidates[0];
+	// Process any remaining incomplete orders (timeout-based completion)
+	console.log(`Processing remaining ${pending.length} pending orders`);
+	const now = Date.now();
+	for (const pendingOrder of pending) {
+		if (!pendingOrder.isComplete) {
+			if (pendingOrder.executions.length > 0) {
+				// Has executions - check timeout
+				const lastExecTime = Math.max(...pendingOrder.executions.map((e: any) =>
+					new Date(e.timestamp).getTime()
+				));
 
-				if (delivered) {
-					const byUnit = candidates.find((p: any) => CrowdBfExplorer.sameUnit(p.assetOut, delivered.unit));
-					if (byUnit) pair = byUnit;
-				}
-
-				const idx = pending.indexOf(pair);
-				if (idx >= 0) pending.splice(idx, 1);
-
-				// BUY (ADA -> token)
-				if (pair.assetIn === 'lovelace' && delivered) {
-					const adaIn = CrowdBfExplorer.toAda(pair.amountIn);
-					const tokenOut = Number(delivered.qty);
-
-					if (adaIn != null && Number.isFinite(tokenOut) && tokenOut > 0) {
-						const identifier = CrowdBfExplorer.normalizeIdentifier(delivered.unit);
-						const assetName = CrowdBfExplorer.decodeAssetNameFromIdentifier(identifier);
-						const rawPrice = adaIn / tokenOut; // ADA per token
-
-						trades.push({
-							timestamp: order.timestamp,
-							direction: "BUY",
-							assetName,
-							identifier,
-							amountIn: CrowdBfExplorer.formatNum6(adaIn),
-							amountOut: CrowdBfExplorer.formatNum6(tokenOut),
-							price: CrowdBfExplorer.formatPrice6(rawPrice),
-							txHash: order.txHash,
-						});
+				// If last execution was more than 5 minutes ago, consider it complete
+				if (now - lastExecTime > 5 * 60 * 1000) {
+					const trade = CrowdBfExplorer.processFinalTrade(pendingOrder, walletAddress);
+					if (trade) {
+						trades.push(trade);
+						console.log(`Timeout-completed trade: ${pendingOrder.txid}`);
 					}
-					continue;
 				}
-
-				// SELL (token -> ADA)
-				if (pair.assetIn !== 'lovelace') {
-					let lovelaceToWallet = 0;
-					for (const o of (order.outputs || [])) {
-						if (o?.address === walletAddress) {
-							for (const a of (o.amount || [])) {
-								if (a.unit === 'lovelace') {
-									lovelaceToWallet += Number(a.quantity || '0');
-								}
-							}
-						}
-					}
-
-					const adaOut = CrowdBfExplorer.toAda(String(lovelaceToWallet));
-					const tokenIn = Number(pair.amountIn);
-
-					if (adaOut != null && Number.isFinite(tokenIn) && tokenIn > 0) {
-						const identifier = CrowdBfExplorer.normalizeIdentifier(pair.assetIn);
-						const assetName = CrowdBfExplorer.decodeAssetNameFromIdentifier(identifier);
-						const rawPrice = adaOut / tokenIn; // ADA per token
-
-						trades.push({
-							timestamp: order.timestamp,
-							direction: "SELL",
-							assetName,
-							identifier,
-							amountIn: CrowdBfExplorer.formatNum6(tokenIn),
-							amountOut: CrowdBfExplorer.formatNum6(adaOut),
-							price: CrowdBfExplorer.formatPrice6(rawPrice),
-							txHash: order.txHash,
-						});
+			} else {
+				// No executions - this might be a standalone trade (like Dexhunter)
+				// Check if order is old enough to be considered complete
+				const orderAge = now - pendingOrder.ts;
+				if (orderAge > 2 * 60 * 1000) { // 2 minutes old
+					const standaloneTrade = CrowdBfExplorer.processStandaloneTrade(pendingOrder, walletAddress);
+					if (standaloneTrade) {
+						trades.push(standaloneTrade);
+						console.log(`Standalone pending trade: ${pendingOrder.txid}`);
 					}
 				}
 			}
 		}
+	}
+
+	console.log(`Final result: ${trades.length} trades found`);
+
+	return {
+		trades,
+		summary: {
+			totalTrades: trades.length,
+			buyTrades: trades.filter(t => t.direction === 'BUY').length,
+			sellTrades: trades.filter(t => t.direction === 'SELL').length,
+			ordersScanned: orders.length,
+			transactionsScanned: orderHistory.transactionsScanned,
+			aggregatedOrders: trades.filter(t => t.executionCount > 1).length,
+		}
+	};
+}
+
+/**
+ * Extract order intent from placement transaction
+ */
+private static extractOrderIntent(order: any, walletAddress: string) {
+	const userInputs = order.inputs?.filter((input: any) => input.address === walletAddress) || [];
+	const userOutputs = order.outputs?.filter((output: any) => output.address === walletAddress) || [];
+
+	if (userInputs.length === 0) return null;
+
+	// Calculate what user is sending vs receiving
+	const assetsIn = userInputs.flatMap((input: any) => input.amount || []);
+	const assetsOut = userOutputs.flatMap((output: any) => output.amount || []);
+
+	const tokensIn = assetsIn.filter((asset: any) => asset.unit !== 'lovelace');
+	const tokensOut = assetsOut.filter((asset: any) => asset.unit !== 'lovelace');
+
+	const adaIn = assetsIn
+		.filter((asset: any) => asset.unit === 'lovelace')
+		.reduce((sum: number, asset: any) => sum + parseInt(asset.quantity || '0'), 0);
+
+	const adaOut = assetsOut
+		.filter((asset: any) => asset.unit === 'lovelace')
+		.reduce((sum: number, asset: any) => sum + parseInt(asset.quantity || '0'), 0);
+
+	console.log(`Order ${order.txHash}: ADA in=${adaIn}, ADA out=${adaOut}, tokens in=${tokensIn.length}, tokens out=${tokensOut.length}`);
+
+	// Determine order type and assets
+	if (tokensIn.length > 0 && tokensOut.length === 0) {
+		// User is sending tokens and not receiving any back - likely a SELL order
+		const primaryToken = tokensIn[0];
+		return {
+			assetIn: primaryToken.unit,
+			assetOut: 'lovelace',
+			amountIn: primaryToken.quantity,
+			orderType: 'sell'
+		};
+	} else if (tokensIn.length === 0 && adaIn > adaOut + 1000000) { // 1 ADA threshold for fees
+		// User is sending more ADA than receiving - likely a BUY order
+		const netAda = adaIn - adaOut;
+		return {
+			assetIn: 'lovelace',
+			assetOut: 'unknown', // Will be determined from execution
+			amountIn: String(netAda),
+			orderType: 'buy'
+		};
+	} else if (tokensIn.length > 0 && tokensOut.length > 0) {
+		// User sending and receiving tokens - could be a swap
+		const primaryTokenIn = tokensIn[0];
+		const primaryTokenOut = tokensOut[0];
+
+		if (primaryTokenIn.unit !== primaryTokenOut.unit) {
+			return {
+				assetIn: primaryTokenIn.unit,
+				assetOut: primaryTokenOut.unit,
+				amountIn: primaryTokenIn.quantity,
+				orderType: 'swap'
+			};
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Check if an order is complete based on execution timing
+ */
+private static isOrderComplete(order: any, currentTime: number): boolean {
+	if (order.executions.length === 0) return false;
+
+	const lastExecTime = Math.max(...order.executions.map((e: any) =>
+		new Date(e.timestamp).getTime()
+	));
+
+	// Consider order complete if no new executions for 2 minutes
+	return currentTime - lastExecTime > 2 * 60 * 1000;
+}
+
+/**
+ * Process final trade from aggregated executions
+ */
+private static processFinalTrade(order: any, walletAddress: string) {
+	if (order.executions.length === 0) return null;
+
+	// Aggregate all deliveries across executions
+	const totalDelivered = order.executions.reduce((total: any, exec: any) => {
+		if (exec.delivered) {
+			if (!total.unit) {
+				total.unit = exec.delivered.unit;
+				total.qty = 0;
+			}
+			if (CrowdBfExplorer.sameUnit(total.unit, exec.delivered.unit)) {
+				total.qty += exec.delivered.qty;
+			}
+		}
+		return total;
+	}, { unit: null, qty: 0 });
+
+	// Calculate total ADA received (for SELL orders)
+	let totalAdaReceived = 0;
+	if (order.orderType === 'sell') {
+		for (const exec of order.executions) {
+			for (const output of (exec.order.outputs || [])) {
+				if (output.address === walletAddress) {
+					for (const amount of (output.amount || [])) {
+						if (amount.unit === 'lovelace') {
+							totalAdaReceived += parseInt(amount.quantity || '0');
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Build final trade object
+	const platforms = [...new Set(order.executions.map((e: any) => e.platform))];
+	const firstExecution = order.executions[0];
+
+	if (order.assetIn === 'lovelace' && totalDelivered.unit && totalDelivered.qty > 0) {
+		// BUY trade
+		const adaIn = CrowdBfExplorer.toAda(order.amountIn);
+		const tokenOut = totalDelivered.qty;
+
+		if (adaIn && Number.isFinite(tokenOut) && tokenOut > 0) {
+			const identifier = CrowdBfExplorer.normalizeIdentifier(totalDelivered.unit);
+			const assetName = CrowdBfExplorer.decodeAssetNameFromIdentifier(identifier);
+			const rawPrice = adaIn / tokenOut;
+
+			return {
+				timestamp: firstExecution.timestamp,
+				direction: "BUY",
+				assetName,
+				identifier,
+				amountIn: CrowdBfExplorer.formatNum6(adaIn),
+				amountOut: CrowdBfExplorer.formatNum6(tokenOut),
+				price: CrowdBfExplorer.formatPrice6(rawPrice),
+				txHash: order.txid,
+				executionCount: order.executions.length,
+				platforms: platforms.join(', '),
+				executionHashes: order.executions.map((e: any) => e.txHash),
+			};
+		}
+	} else if (order.assetIn !== 'lovelace' && totalAdaReceived > 0) {
+		// SELL trade
+		const tokenIn = Number(order.amountIn);
+		const adaOut = CrowdBfExplorer.toAda(String(totalAdaReceived));
+
+		if (adaOut && Number.isFinite(tokenIn) && tokenIn > 0) {
+			const identifier = CrowdBfExplorer.normalizeIdentifier(order.assetIn);
+			const assetName = CrowdBfExplorer.decodeAssetNameFromIdentifier(identifier);
+			const rawPrice = adaOut / tokenIn;
+
+			return {
+				timestamp: firstExecution.timestamp,
+				direction: "SELL",
+				assetName,
+				identifier,
+				amountIn: CrowdBfExplorer.formatNum6(tokenIn),
+				amountOut: CrowdBfExplorer.formatNum6(adaOut),
+				price: CrowdBfExplorer.formatPrice6(rawPrice),
+				txHash: order.txid,
+				executionCount: order.executions.length,
+				platforms: platforms.join(', '),
+				executionHashes: order.executions.map((e: any) => e.txHash),
+			};
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Process standalone trade (like Dexhunter) that doesn't have separate execution transactions
+ */
+private static processStandaloneTrade(order: any, _walletAddress: string) {
+	// For standalone trades, we need to analyze the order transaction itself
+	// to determine what was traded
+
+	if (!order.txid) return null;
+
+	// This would need the actual order transaction data
+	// For now, we'll create a placeholder that shows the order was detected
+	// but couldn't be fully parsed
+
+	return {
+		timestamp: new Date(order.ts).toISOString(),
+		direction: "UNKNOWN",
+		assetName: "Unknown Asset",
+		identifier: order.assetOut || "unknown",
+		amountIn: order.amountIn ? CrowdBfExplorer.formatNum6(Number(order.amountIn) / 1e6) : "0.000000",
+		amountOut: "0.000000",
+		price: "0.000000",
+		txHash: order.txid,
+		executionCount: 0,
+		platforms: 'Dexhunter',
+		executionHashes: [],
+		note: "Standalone trade detected but full parsing not implemented"
+	};
+}
+
+/**
+ * Process orphaned execution (execution without matching placement order)
+ */
+private static processOrphanedExecution(order: any, walletAddress: string) {
+	const delivered = CrowdBfExplorer.tokensReceived(order, walletAddress, undefined);
+
+	if (!delivered) return null;
+
+	// For orphaned executions, we need to infer the input from the transaction
+	// Look at what was likely sent to get this delivery
+	let adaSpent = 0;
+
+	// Check for ADA that went to DEX/pool addresses (not back to user)
+	for (const output of (order.outputs || [])) {
+		if (output.address !== walletAddress) {
+			for (const amount of (output.amount || [])) {
+				if (amount.unit === 'lovelace') {
+					adaSpent += parseInt(amount.quantity || '0');
+				}
+			}
+		}
+	}
+
+	if (adaSpent > 0) {
+		const adaIn = CrowdBfExplorer.toAda(String(adaSpent));
+		const tokenOut = delivered.qty;
+
+		if (adaIn && Number.isFinite(tokenOut) && tokenOut > 0) {
+			const identifier = CrowdBfExplorer.normalizeIdentifier(delivered.unit);
+			const assetName = CrowdBfExplorer.decodeAssetNameFromIdentifier(identifier);
+			const rawPrice = adaIn / tokenOut;
+
+			return {
+				timestamp: order.timestamp,
+				direction: "BUY",
+				assetName,
+				identifier,
+				amountIn: CrowdBfExplorer.formatNum6(adaIn),
+				amountOut: CrowdBfExplorer.formatNum6(tokenOut),
+				price: CrowdBfExplorer.formatPrice6(rawPrice),
+				txHash: order.txHash,
+				executionCount: 1,
+				platforms: order.dexDetection?.platform || 'Unknown',
+				executionHashes: [order.txHash],
+				note: "Orphaned execution - placement order not found in scan window"
+			};
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Process generic DEX transaction (SteelSwap, etc.)
+ */
+private static processGenericDexTransaction(order: any, walletAddress: string) {
+	const userInputs = order.inputs?.filter((input: any) => input.address === walletAddress) || [];
+	const userOutputs = order.outputs?.filter((output: any) => output.address === walletAddress) || [];
+
+	if (userInputs.length === 0 || userOutputs.length === 0) return null;
+
+	// Calculate net flows
+	const assetsIn = userInputs.flatMap((input: any) => input.amount || []);
+	const assetsOut = userOutputs.flatMap((output: any) => output.amount || []);
+
+	const adaIn = assetsIn
+		.filter((asset: any) => asset.unit === 'lovelace')
+		.reduce((sum: number, asset: any) => sum + parseInt(asset.quantity || '0'), 0);
+
+	const adaOut = assetsOut
+		.filter((asset: any) => asset.unit === 'lovelace')
+		.reduce((sum: number, asset: any) => sum + parseInt(asset.quantity || '0'), 0);
+
+	const netAda = adaOut - adaIn; // Positive if user received ADA, negative if user sent ADA
+
+	// If user received net ADA, this was likely a SELL
+	if (netAda > 1000000) { // Received more than 1 ADA
+		const adaReceived = CrowdBfExplorer.toAda(String(netAda));
 
 		return {
-			trades,
-			summary: {
-				totalTrades: trades.length,
-				buyTrades: trades.filter(t => t.direction === 'BUY').length,
-				sellTrades: trades.filter(t => t.direction === 'SELL').length,
-				ordersScanned: orders.length,
-				transactionsScanned: orderHistory.transactionsScanned,
-			}
+			timestamp: order.timestamp,
+			direction: "SELL",
+			assetName: "Unknown Token",
+			identifier: "unknown",
+			amountIn: "0.000000",
+			amountOut: CrowdBfExplorer.formatNum6(adaReceived || 0),
+			price: "0.000000",
+			txHash: order.txHash,
+			executionCount: 1,
+			platforms: order.dexDetection?.platform || 'Unknown DEX',
+			executionHashes: [order.txHash],
+			note: "Generic DEX transaction - full parsing not implemented"
 		};
 	}
 
+	// If user sent net ADA, this was likely a BUY
+	if (netAda < -1000000) { // Sent more than 1 ADA
+		const adaSent = CrowdBfExplorer.toAda(String(-netAda));
+
+		return {
+			timestamp: order.timestamp,
+			direction: "BUY",
+			assetName: "Unknown Token",
+			identifier: "unknown",
+			amountIn: CrowdBfExplorer.formatNum6(adaSent || 0),
+			amountOut: "0.000000",
+			price: "0.000000",
+			txHash: order.txHash,
+			executionCount: 1,
+			platforms: order.dexDetection?.platform || 'Unknown DEX',
+			executionHashes: [order.txHash],
+			note: "Generic DEX transaction - full parsing not implemented"
+		};
+	}
+
+	return null;
+}
 	/**
 	 * Parse CIP-674 metadata
 	 */
